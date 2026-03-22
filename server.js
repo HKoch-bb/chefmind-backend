@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ override: true });
 const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
@@ -8,7 +8,6 @@ app.use(cors());
 app.use(express.json({ limit: "15mb" }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 /* ── Cache ── */
 const cache = new Map();
 const CACHE_TTL = 1000 * 60 * 10;
