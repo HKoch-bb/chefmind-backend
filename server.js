@@ -430,6 +430,48 @@ RETURN VALID JSON ONLY:
   }
 });
 
+/* ── Swap Single Meal ── */
+app.post("/swap-meal", async (req, res) => {
+  try {
+    const { day, mealType, currentMeal, ingredients = [], filters = {}, language = "English" } = req.body;
+    if (!day || !mealType) return res.status(400).json({ error: "Missing day or mealType" });
+
+    const filterLines = buildFilterLines(filters);
+    const filterBlock = filterLines ? `\nFILTER CONSTRAINTS:\n${filterLines}\n` : "";
+    const langLine = buildLanguageLine(language);
+    const systemMsg = `You are a professional meal planner.${langLine}`;
+    const ingredientHint = ingredients.length
+      ? `Available ingredients: ${ingredients.map(i => [i.qty, i.unit, i.name].filter(Boolean).join(" ")).join(", ")}.`
+      : "";
+
+    const prompt = `${filterBlock}
+Suggest ONE new ${mealType} meal for ${day}.
+${ingredientHint}
+${currentMeal ? `Do NOT suggest "${currentMeal}" — it must be a different meal.` : ""}
+Keep it practical and quick.
+
+RETURN VALID JSON ONLY:
+{ "name": "", "note": "" }`;
+
+    const response = await withRetry(() =>
+      openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemMsg },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 200,
+      })
+    );
+    const data = JSON.parse(response.choices[0].message.content);
+    res.json({ name: data.name || "", note: data.note || "" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to swap meal" });
+  }
+});
+
 /* ── Generate By Nutrition ── */
 app.post("/generate-by-nutrition", async (req, res) => {
   try {
@@ -439,6 +481,7 @@ app.post("/generate-by-nutrition", async (req, res) => {
       targets.protein  && `- Protein per serving: ~${targets.protein}g`,
       targets.carbs    && `- Carbs per serving: ~${targets.carbs}g`,
       targets.fat      && `- Fat per serving: ~${targets.fat}g`,
+      targets.fiber    && `- Dietary Fiber per serving: ~${targets.fiber}g`,
     ].filter(Boolean);
     if (!targetLines.length) return res.status(400).json({ error: "No nutrition targets provided" });
 
@@ -463,6 +506,7 @@ RETURN VALID JSON ONLY:
       "protein_g": 0,
       "carbs_g": 0,
       "fat_g": 0,
+      "fiber_g": 0,
       "match_note": "one sentence on how well this matches the targets"
     }
   ]
