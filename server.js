@@ -1,6 +1,7 @@
 require("dotenv").config({ override: true });
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const OpenAI = require("openai");
 
 const app = express();
@@ -8,6 +9,80 @@ app.use(cors());
 app.use(express.json({ limit: "15mb" }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+/* ── Rate Limiters ───────────────────────────────────────────────────────────
+ *
+ *  Four tiers based on cost and abuse surface:
+ *
+ *  heavyLimiter   — Full recipe/meal-plan generation (GPT-4.1-mini, long prompts)
+ *                   15 requests per 15 min per IP. ~1 call/min max burst.
+ *
+ *  standardLimiter — Lighter AI calls: details, subs, swaps, nutrition summary
+ *                   30 requests per 15 min per IP.
+ *
+ *  chatLimiter    — Streaming chat. Shorter window (5 min) to prevent spam.
+ *                   20 messages per 5 min per IP.
+ *
+ *  visionLimiter  — Image identify (GPT-4o vision). Most expensive endpoint.
+ *                   8 requests per 15 min per IP.
+ *
+ *  imageLimiter   — Pexels proxy. Not an LLM call, but rate-limit anyway.
+ *                   60 requests per 15 min per IP.
+ */
+
+const heavyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many generation requests. Please wait a few minutes and try again.",
+  },
+  skip: (req) => process.env.NODE_ENV === "test",
+});
+
+const standardLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many requests. Please slow down and try again shortly.",
+  },
+  skip: (req) => process.env.NODE_ENV === "test",
+});
+
+const chatLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many chat messages. Give the chef a moment! 🧑‍🍳",
+  },
+  skip: (req) => process.env.NODE_ENV === "test",
+});
+
+const visionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many image scans. Please wait before scanning another photo.",
+  },
+  skip: (req) => process.env.NODE_ENV === "test",
+});
+
+const imageLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many image requests." },
+  skip: (req) => process.env.NODE_ENV === "test",
+});
+
 /* ── Cache ── */
 const cache = new Map();
 const CACHE_TTL = 1000 * 60 * 10;
@@ -20,9 +95,14 @@ const getCache = (key) => {
 };
 
 /* ── Retry ── */
-async function withRetry(fn, retries = 2) {
+async function withRetry(fn, retries = 2, attempt = 0) {
   try { return await fn(); }
-  catch (err) { if (retries === 0) throw err; return withRetry(fn, retries - 1); }
+  catch (err) {
+    if (retries === 0) throw err;
+    // Exponential backoff: 500ms, 1000ms, …
+    await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+    return withRetry(fn, retries - 1, attempt + 1);
+  }
 }
 
 /* ── Helpers ── */
@@ -60,8 +140,11 @@ const normalizeFlexible = (r, i) => ({
   missing_ingredients: (r?.missing_ingredients || []).map(m => ({ name: m.name || "", qty: m.qty || "", unit: m.unit || "" })),
 });
 
+/* ── Health ── */
+app.get("/", (req, res) => res.send("✅ ChefMind API running"));
+
 /* ── Pexels Image Proxy ── */
-app.get("/image", async (req, res) => {
+app.get("/image", imageLimiter, async (req, res) => {
   try {
     const query = (req.query.q || "food").trim();
     const cacheKey = `img:${query.toLowerCase()}`;
@@ -86,7 +169,7 @@ app.get("/image", async (req, res) => {
 });
 
 /* ── Identify Ingredients from Image ── */
-app.post("/identify-image", async (req, res) => {
+app.post("/identify-image", visionLimiter, async (req, res) => {
   try {
     const { base64, mimeType = "image/jpeg" } = req.body;
     if (!base64) return res.status(400).json({ error: "No image data" });
@@ -121,11 +204,8 @@ RETURN VALID JSON ONLY:
   }
 });
 
-/* ── Health ── */
-app.get("/", (req, res) => res.send("✅ ChefMind API running"));
-
 /* ── Generate Recipes ── */
-app.post("/generate-recipes", async (req, res) => {
+app.post("/generate-recipes", heavyLimiter, async (req, res) => {
   try {
     const { ingredients = [], filters = {}, language = "English" } = req.body;
     if (!ingredients.length) return res.status(400).json({ error: "No ingredients" });
@@ -181,7 +261,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── Generate Meal Plan ── */
-app.post("/generate-meal-plan", async (req, res) => {
+app.post("/generate-meal-plan", heavyLimiter, async (req, res) => {
   try {
     const { ingredients = [], filters = {}, mode = "pantry", language = "English" } = req.body;
     if (!ingredients.length) return res.status(400).json({ error: "No ingredients" });
@@ -251,7 +331,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── Recipe Details ── */
-app.post("/recipe-details", async (req, res) => {
+app.post("/recipe-details", standardLimiter, async (req, res) => {
   try {
     const { recipeName, language = "English" } = req.body;
     const cacheKey = `details:${recipeName}:${language}`;
@@ -298,7 +378,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── Generate By Name ── */
-app.post("/generate-by-name", async (req, res) => {
+app.post("/generate-by-name", heavyLimiter, async (req, res) => {
   try {
     const { recipeName, filters = {}, language = "English" } = req.body;
     if (!recipeName?.trim()) return res.status(400).json({ error: "No recipe name" });
@@ -360,7 +440,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── Ingredient Substitution ── */
-app.post("/ingredient-sub", async (req, res) => {
+app.post("/ingredient-sub", standardLimiter, async (req, res) => {
   try {
     const { ingredient, recipeName, language = "English" } = req.body;
     if (!ingredient) return res.status(400).json({ error: "No ingredient" });
@@ -396,7 +476,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── Nutrition Summary ── */
-app.post("/nutrition-summary", async (req, res) => {
+app.post("/nutrition-summary", standardLimiter, async (req, res) => {
   try {
     const { mealNames = [] } = req.body;
     if (!mealNames.length) return res.status(400).json({ error: "No meals" });
@@ -431,7 +511,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── Swap Single Meal ── */
-app.post("/swap-meal", async (req, res) => {
+app.post("/swap-meal", standardLimiter, async (req, res) => {
   try {
     const { day, mealType, currentMeal, ingredients = [], filters = {}, language = "English" } = req.body;
     if (!day || !mealType) return res.status(400).json({ error: "Missing day or mealType" });
@@ -473,7 +553,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── Generate By Nutrition ── */
-app.post("/generate-by-nutrition", async (req, res) => {
+app.post("/generate-by-nutrition", heavyLimiter, async (req, res) => {
   try {
     const { targets = {}, filters = {}, language = "English" } = req.body;
     const targetLines = [
@@ -532,7 +612,7 @@ RETURN VALID JSON ONLY:
 });
 
 /* ── AI Chef Chat ── */
-app.post("/chat", async (req, res) => {
+app.post("/chat", chatLimiter, async (req, res) => {
   try {
     const {
       messages = [],
